@@ -1,6 +1,3 @@
-output "users_prod_url" {
-  value = {
-    for key, stage in aws_api_gateway_stage.prods :
-    key => stage.invoke_url
-  }
+output "sfn_orders_state_machine" {
+  value = aws_sfn_state_machine.order_workflow.arn
 }

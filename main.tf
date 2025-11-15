@@ -2,11 +2,31 @@ provider "aws" {
   region = var.aws_region
 }
 
-resource "aws_dynamodb_table" "users_restaurants" {
-  name           = "pc-users-restaurants"
-  read_capacity  = 20
-  write_capacity = 20
-  hash_key       = "tenant_id"
+data "aws_lambda_function" "start_order_execution" {
+  function_name = "pc-orders-dev-start_order_execution"
+}
+
+data "aws_lambda_function" "put_order_task_token" {
+  function_name = "pc-orders-dev-put_order_task_token"
+}
+
+data "aws_lambda_function" "resume_order_workflow" {
+  function_name = "pc-orders-dev-resume_order_workflow"
+}
+
+data "aws_lambda_function" "broadcast_order_create" {
+  function_name = "pc-orders-dev-broadcast_order_create"
+}
+
+data "aws_lambda_function" "broadcast_order_status" {
+  function_name = "pc-orders-dev-broadcast_order_status"
+}
+
+resource "aws_dynamodb_table" "restaurants" {
+  name         = "pc-users-restaurants"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key = "tenant_id"
 
   attribute {
     name = "tenant_id"
@@ -14,12 +34,12 @@ resource "aws_dynamodb_table" "users_restaurants" {
   }
 }
 
-resource "aws_dynamodb_table" "users_users" {
-  name           = "pc-users-users"
-  read_capacity  = 20
-  write_capacity = 20
-  hash_key       = "tenant_id"
-  range_key      = "user_id"
+resource "aws_dynamodb_table" "users" {
+  name         = "pc-users-users"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key  = "tenant_id"
+  range_key = "user_id"
 
   attribute {
     name = "tenant_id"
@@ -30,131 +50,154 @@ resource "aws_dynamodb_table" "users_users" {
     name = "user_id"
     type = "S"
   }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "status-index"
+    hash_key        = "tenant_id"
+    range_key       = "status"
+    projection_type = "ALL"
+  }
+}
+
+resource "aws_dynamodb_table" "orders" {
+  name         = "pc-orders"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key  = "tenant_id"
+  range_key = "order_id"
+
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "order_id"
+    type = "S"
+  }
+}
+
+resource "aws_dynamodb_table" "order_subscriptions" {
+  name         = "pc-order-subscriptions"
+  billing_mode = "PAY_PER_REQUEST"
+
+  hash_key  = "tenant_id"
+  range_key = "connection_id"
+
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "connection_id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "connection-id-index"
+    hash_key        = "connection_id"
+    projection_type = "ALL"
+  }
 }
 
 locals {
-  functions = {
-    users = {
-      runtime   = "python3.13"
-      functions = ["hello", "goodbye"]
-    }
-  }
+  order_state_names = [
+    "WaitForCook",
+    "Cooking",
+    "WaitForDispatcher",
+    "Dispatching",
+    "WaitForDeliverer",
+    "Delivering",
+    "Complete"
+  ]
 
-  apis = {
-    users = {
-      openapi = "3.0.1"
-
-      info = {
-        title   = "PizzaCold Users API"
-        version = "0.1.0"
-      }
-
-      paths = {
-        "/hello" = {
-          get = {
-            x-amazon-apigateway-integration = {
-              httpMethod = "POST"
-              type       = "aws_proxy"
-              uri        = aws_lambda_function.functions["users-hello"].invoke_arn
-            }
-          }
-        }
-        "/goodbye" = {
-          get = {
-            x-amazon-apigateway-integration = {
-              httpMethod = "POST"
-              type       = "aws_proxy"
-              uri        = aws_lambda_function.functions["users-goodbye"].invoke_arn
-            }
-          }
+  order_states = {
+    for i, name in local.order_state_names :
+    name => {
+      Type     = "Task"
+      Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
+      Parameters = {
+        FunctionName = data.aws_lambda_function.put_order_task_token.function_name
+        Payload = {
+          "tenant_id.$" : "$.detail.tenant_id"
+          "order_id.$" : "$.detail.order_id"
+          "task_token.$" : "$$.Task.Token"
         }
       }
+      Next = i < length(local.order_state_names) - 1 ? local.order_state_names[i + 1] : "FinalStep"
     }
   }
+}
 
-  all_functions = flatten([
-    for api_name, api in local.functions : [
-      for fn_name in api.functions : {
-        api_name    = api_name
-        api_runtime = api.runtime
-        fn_name     = fn_name
+resource "aws_sfn_state_machine" "order_workflow" {
+  name     = "pc-order-workflow"
+  role_arn = var.labrole_arn
+
+  definition = jsonencode({
+    StartAt = "WaitForCook"
+    States = merge(local.order_states, {
+      FinalStep = {
+        Type = "Pass"
+        End  = true
       }
-    ]
-  ])
-
-  all_functions_keyed = {
-    for f in local.all_functions :
-    "${f.api_name}-${f.fn_name}" => f
-  }
+    })
+  })
 }
 
-resource "aws_s3_bucket" "lambda_artifacts" {
-  bucket = "pc-lambda-artifacts"
+resource "aws_cloudwatch_event_rule" "order_created" {
+  name = "pc-order-created"
+
+  event_pattern = jsonencode({
+    source      = ["pc.orders"],
+    detail-type = ["order.created"]
+  })
 }
 
-resource "aws_s3_object" "zips" {
-  for_each = local.all_functions_keyed
+resource "aws_cloudwatch_event_target" "start_order_execution" {
+  target_id = "pc-order-created"
+  rule      = aws_cloudwatch_event_rule.order_created.name
+  arn       = data.aws_lambda_function.start_order_execution.arn
 
-  bucket = aws_s3_bucket.lambda_artifacts.bucket
-  key    = "lambdas/${each.value.api_name}/${each.value.fn_name}.zip"
+  role_arn = var.labrole_arn
 }
 
-resource "aws_lambda_function" "functions" {
-  for_each = local.all_functions_keyed
+resource "aws_cloudwatch_event_target" "broadcast_order_create" {
+  target_id = "pc-order-created"
+  rule      = aws_cloudwatch_event_rule.order_created.name
+  arn       = data.aws_lambda_function.broadcast_order_create.arn
 
-  function_name = "pc-${each.key}"
-
-  runtime     = each.value.api_runtime
-  handler     = "handler.handler"
-  role        = var.labrole_arn
-  timeout     = 20
-  memory_size = 512
-
-  s3_bucket        = aws_s3_bucket.lambda_artifacts.bucket
-  s3_key           = aws_s3_object.zips[each.key].key
-  source_code_hash = base64encode(aws_s3_object.zips[each.key].etag)
+  role_arn = var.labrole_arn
 }
 
-resource "aws_api_gateway_rest_api" "apis" {
-  for_each = local.apis
+resource "aws_cloudwatch_event_rule" "order_status_updated" {
+  name = "pc-order-status-updated"
 
-  name = "pc-${each.key}-api"
-
-  body = jsonencode(each.value)
-
-  endpoint_configuration {
-    types = ["REGIONAL"]
-  }
+  event_pattern = jsonencode({
+    source      = ["pc.orders"],
+    detail-type = ["order.status_update"],
+  })
 }
 
-resource "aws_lambda_permission" "api_permissions" {
-  for_each = local.all_functions_keyed
+resource "aws_cloudwatch_event_target" "resume_order_workflow" {
+  target_id  = "pc-resume-order-workflow"
+  rule       = aws_cloudwatch_event_rule.order_status_updated.name
+  arn        = data.aws_lambda_function.resume_order_workflow.arn
+  input_path = "$"
 
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.functions[each.key].function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_api_gateway_rest_api.apis[each.value.api_name].execution_arn}/*/*"
+  role_arn = var.labrole_arn
 }
 
-resource "aws_api_gateway_deployment" "deployments" {
-  for_each = local.apis
+resource "aws_cloudwatch_event_target" "broadcast_order_status" {
+  target_id  = "pc-broadcast-order-status"
+  rule       = aws_cloudwatch_event_rule.order_status_updated.name
+  arn        = data.aws_lambda_function.broadcast_order_status.arn
+  input_path = "$"
 
-  rest_api_id = aws_api_gateway_rest_api.apis[each.key].id
-
-  triggers = {
-    redeployment = sha1(jsonencode(aws_api_gateway_rest_api.apis[each.key].body))
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_api_gateway_stage" "prods" {
-  for_each = local.apis
-
-  stage_name    = "prod"
-  rest_api_id   = aws_api_gateway_rest_api.apis[each.key].id
-  deployment_id = aws_api_gateway_deployment.deployments[each.key].id
+  role_arn = var.labrole_arn
 }
